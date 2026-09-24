@@ -1,0 +1,179 @@
+#include <DHT.h>
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+
+// ==========================================
+// ১. পিন ডেফিনেশন (Arduino Mega)
+// ==========================================
+const int moistureSensorPin = A0;  // সয়েল ময়েশ্চার সেন্সর (Analog A0)
+const int mq135Pin          = A1;  // MQ135 গ্যাস সেন্সর (Analog A1)
+const int pumpRelayPin      = 22;  // পাম্প রিলে (Digital 22)
+const int fanRelayPin       = 23;  // ফ্যান রিলে (Digital 23)
+const int redLedPin         = 24;  // অ্যালার্ট লাল এলইডি (Digital 24)
+const int lightRelayPin     = 25;  // হিটার লাইট রিলে (Digital 25)
+
+// DHT22 কনফিগারেশন
+#define DHTPIN 2                   // DHT22 ডাটা পিন (Digital 2)
+#define DHTTYPE DHT22              // সেন্সর টাইপ DHT22
+
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C অ্যাড্রেস 0x27 (প্রয়োজনে 0x3F)
+
+// ==========================================
+// ২. থ্রেশহোল্ড সেটআপ
+// ==========================================
+const int dryThreshold         = 600;   // মাটির শুষ্কতার সীমা (>600 হলে পাম্প চলবে)
+const float lowTempThreshold   = 31.0;  // নিম্ন তাপমাত্রা সীমা (<31 হলে লাইট অন)
+const float highTempThreshold  = 40.0;  // উচ্চ তাপমাত্রা সীমা (>40 হলে ফ্যান অন)
+const int airQualityThreshold  = 100;   // ক্ষতিকর গ্যাসের সীমা (>100 হলে ফ্যান/অ্যালার্ট অন)
+
+void setup() {
+  Serial.begin(9600);   // পিসির সিরিয়াল মনিটরের জন্য (USB)
+  Serial1.begin(9600);  // ESP8266-এ JSON পাঠানোর জন্য (TX1 Pin 18)
+  
+  dht.begin();
+  
+  // LCD ইনিশিয়ালাইজেশন
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Greenhouse Smart");
+  lcd.setCursor(0, 1);
+  lcd.print("System Loading..");
+  delay(2000);
+
+  // পিন মোড সেট করা
+  pinMode(pumpRelayPin, OUTPUT);
+  pinMode(fanRelayPin, OUTPUT);
+  pinMode(lightRelayPin, OUTPUT);
+  pinMode(redLedPin, OUTPUT);
+
+  // শুরুতে সব আউটপুট বন্ধ রাখা (Active-LOW রিলের ক্ষেত্রে HIGH = OFF)
+  digitalWrite(pumpRelayPin, HIGH);
+  digitalWrite(fanRelayPin, HIGH);
+  digitalWrite(lightRelayPin, HIGH);
+  digitalWrite(redLedPin, LOW);
+}
+
+void loop() {
+  bool shouldFanBeOn   = false;
+  bool shouldLightBeOn = false;
+  bool shouldPumpBeOn  = false;
+  bool shouldLedBeOn   = false;
+  String airStatus     = "Good";
+
+  // ==========================================
+  // ১. সয়েল ময়েশ্চার ও অটো সেচ (Pump Control)
+  // ==========================================
+  int moistureLevel = analogRead(moistureSensorPin);
+
+  if (moistureLevel > dryThreshold) {
+    digitalWrite(pumpRelayPin, LOW);   // মাটি শুষ্ক -> পাম্প চালু
+    shouldPumpBeOn = true;
+  } else {
+    digitalWrite(pumpRelayPin, HIGH);  // আর্দ্রতা পর্যাপ্ত -> পাম্প বন্ধ
+    shouldPumpBeOn = false;
+  }
+
+  // ==========================================
+  // ২. তাপমাত্রা ও আর্দ্রতা (Fan & Heater Light)
+  // ==========================================
+  float temperature = dht.readTemperature();
+  float humidity    = dht.readHumidity();
+
+  if (!isnan(temperature)) {
+    // তাপমাত্রা ৪০° এর বেশি হলে -> ফ্যান চলবে, লাইট বন্ধ
+    if (temperature > highTempThreshold) {
+      shouldFanBeOn   = true; 
+      shouldLightBeOn = false;
+    }
+    // তাপমাত্রা ৩১° এর নিচে নামলে -> লাইট চলবে, ফ্যান বন্ধ
+    else if (temperature < lowTempThreshold) {
+      shouldLightBeOn = true;  
+      shouldFanBeOn   = false;
+      shouldLedBeOn   = true;  // কম তাপমাত্রায় ইন্ডিকেটর অন
+    }
+    // ৩১° থেকে ৪০° এর মাঝে থাকলে -> ফ্যান ও লাইট উভয়ই বন্ধ
+    else {
+      shouldLightBeOn = false;
+      shouldFanBeOn   = false;
+    }
+  }
+
+  // ==========================================
+  // ৩. গ্যাস সেন্সর পরীক্ষা (MQ135)
+  // ==========================================
+  int airQualityRaw = analogRead(mq135Pin);
+
+  if (airQualityRaw > airQualityThreshold) {
+    shouldFanBeOn = true;   // গ্যাস বের করতে ফ্যান চলবে
+    shouldLedBeOn = true;   // সতর্কবার্তা লাল LED জ্বলবে
+    airStatus     = "BAD!";
+  }
+
+  // ==========================================
+  // ৪. রিলে ও অ্যালার্ট এলইডি এক্সিকিউশন
+  // ==========================================
+  digitalWrite(fanRelayPin, shouldFanBeOn ? LOW : HIGH);
+  digitalWrite(lightRelayPin, shouldLightBeOn ? LOW : HIGH);
+  digitalWrite(redLedPin, shouldLedBeOn ? HIGH : LOW);
+
+  // ==========================================
+  // ৫. ESP8266-এর জন্য JSON তৈরি ও ট্রান্সমিট (Serial1)
+  // ==========================================
+  String jsonPayload = "{";
+  jsonPayload += "\"temperature\":" + String(isnan(temperature) ? 0.0 : temperature, 1) + ",";
+  jsonPayload += "\"humidity\":" + String(isnan(humidity) ? 0.0 : humidity, 1) + ",";
+  jsonPayload += "\"soilMoisture\":" + String(moistureLevel) + ",";
+  jsonPayload += "\"airQuality\":" + String(airQualityRaw) + ",";
+  jsonPayload += "\"pumpStatus\":" + String(shouldPumpBeOn ? "true" : "false") + ",";
+  jsonPayload += "\"fanStatus\":" + String(shouldFanBeOn ? "true" : "false") + ",";
+  jsonPayload += "\"lightStatus\":" + String(shouldLightBeOn ? "true" : "false");
+  jsonPayload += "}";
+
+  // Serial1 (Pin 18 TX1) দিয়ে ESP8266-এ পাঠানো হচ্ছে
+  Serial1.println(jsonPayload);
+
+  // কম্পিউটারের সিরিয়াল মনিটরে লগ দেখাচ্ছে
+  Serial.print("[JSON to ESP8266]: ");
+  Serial.println(jsonPayload);
+
+  // ==========================================
+  // ৬. আইটুসি এলসিডি ডিসপ্লে স্ক্রিন ১ (Temp & Humid)
+  // ==========================================
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp: ");
+  if (isnan(temperature)) {
+    lcd.print("Error");
+  } else {
+    lcd.print(temperature, 1);
+    lcd.print("C");
+    if (temperature < lowTempThreshold) lcd.print(" (COLD)");
+    else if (temperature > highTempThreshold) lcd.print(" (HOT)");
+    else lcd.print(" (OK)");
+  }
+  
+  lcd.setCursor(0, 1);
+  lcd.print("Humid: ");
+  if (isnan(humidity)) lcd.print("Error");
+  else { lcd.print(humidity, 0); lcd.print("%"); }
+  delay(2000); // ২ সেকেন্ড ডিসপ্লে থাকবে
+
+  // ==========================================
+  // ৭. আইটুসি এলসিডি ডিসপ্লে স্ক্রিন ২ (Soil & Air)
+  // ==========================================
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Soil: ");
+  lcd.print(moistureLevel);
+  if (moistureLevel > dryThreshold) lcd.print(" (Dry)");
+  else lcd.print(" (Wet)");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Air: ");
+  lcd.print(airQualityRaw);
+  lcd.print(" (" + airStatus + ")");
+  delay(2000); // ২ সেকেন্ড ডিসপ্লে থাকবে
+}
